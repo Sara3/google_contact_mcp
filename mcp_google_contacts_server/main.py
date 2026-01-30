@@ -3,7 +3,6 @@ MCP Google Contacts Server with per-user OAuth authentication.
 Designed for hosting on Render.
 """
 import os
-import json
 import secrets
 from typing import Optional, Dict, Any
 
@@ -33,8 +32,9 @@ SCOPES = [
 user_tokens: Dict[str, Dict[str, Any]] = {}
 pending_states: Dict[str, str] = {}
 
-# Initialize MCP server
+# Initialize MCP server and SSE transport
 mcp_server = Server("google-contacts")
+sse = SseServerTransport("/messages/")
 
 
 def get_oauth_config():
@@ -71,11 +71,11 @@ async def list_tools():
     return [
         Tool(
             name="list_contacts",
-            description="List all contacts or filter by name",
+            description="List all contacts or filter by name. First authenticate at " + BASE_URL + "/auth",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "session_token": {"type": "string", "description": "Your authentication session token"},
+                    "session_token": {"type": "string", "description": "Your authentication session token from /auth"},
                     "name_filter": {"type": "string", "description": "Optional filter by name"},
                     "max_results": {"type": "integer", "description": "Max results", "default": 100}
                 },
@@ -143,7 +143,7 @@ async def call_tool(name: str, arguments: dict):
     service = get_user_service(session_token)
     
     if not service:
-        return [TextContent(type="text", text=f"Not authenticated. Visit {BASE_URL}/auth to login.")]
+        return [TextContent(type="text", text=f"Not authenticated. Visit {BASE_URL}/auth to login with your Google account first.")]
     
     try:
         if name == "list_contacts":
@@ -158,7 +158,7 @@ async def call_tool(name: str, arguments: dict):
             if not contacts:
                 return [TextContent(type="text", text="No contacts found.")]
             
-            name_filter = arguments.get("name_filter", "").lower() if arguments.get("name_filter") else ""
+            name_filter = (arguments.get("name_filter") or "").lower()
             output = []
             for person in contacts:
                 names = person.get('names', [])
@@ -214,7 +214,7 @@ async def call_tool(name: str, arguments: dict):
         
         elif name == "delete_contact":
             service.people().deleteContact(resourceName=arguments.get('resource_name')).execute()
-            return [TextContent(type="text", text=f"Contact deleted.")]
+            return [TextContent(type="text", text="Contact deleted.")]
         
         elif name == "search_contacts":
             results = service.people().connections().list(
@@ -250,7 +250,7 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-# HTTP endpoints
+# HTTP route handlers
 async def homepage(request: Request):
     return JSONResponse({
         "service": "Google Contacts MCP Server",
@@ -324,14 +324,10 @@ async def check_status(request: Request):
     return JSONResponse({"authenticated": False})
 
 
-# SSE endpoint for MCP
-sse_transport = SseServerTransport("/messages/")
-
-
-async def handle_sse(request: Request):
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
+# SSE endpoint - raw ASGI handler
+async def handle_sse(scope, receive, send):
+    """Handle SSE connections for MCP."""
+    async with sse.connect_sse(scope, receive, send) as streams:
         await mcp_server.run(
             streams[0],
             streams[1],
@@ -339,24 +335,36 @@ async def handle_sse(request: Request):
         )
 
 
-async def handle_messages(request: Request):
-    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+# Messages endpoint - raw ASGI handler  
+async def handle_messages(scope, receive, send):
+    """Handle POST messages for MCP."""
+    await sse.handle_post_message(scope, receive, send)
 
 
-# Build app
+# Build the Starlette app with routes
 app = Starlette(
     routes=[
         Route("/", homepage),
         Route("/auth", start_auth),
         Route("/oauth/callback", oauth_callback),
         Route("/status/{session_token}", check_status),
-        Route("/sse", handle_sse),
-        Route("/messages/", handle_messages, methods=["POST"]),
     ]
 )
+
+
+# Create a combined ASGI app that handles both Starlette routes and raw SSE endpoints
+async def combined_app(scope, receive, send):
+    path = scope.get("path", "")
+    
+    if path == "/sse":
+        await handle_sse(scope, receive, send)
+    elif path.startswith("/messages"):
+        await handle_messages(scope, receive, send)
+    else:
+        await app(scope, receive, send)
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(combined_app, host="0.0.0.0", port=port)
