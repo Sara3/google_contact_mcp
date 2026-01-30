@@ -36,6 +36,22 @@ pending_states: Dict[str, str] = {}
 mcp_server = Server("google-contacts")
 sse = SseServerTransport("/messages/")
 
+# All available person fields for complete contact data
+PERSON_FIELDS = ','.join([
+    'names',
+    'emailAddresses', 
+    'phoneNumbers',
+    'addresses',
+    'birthdays',
+    'organizations',
+    'photos',
+    'biographies',
+    'urls',
+    'relations',
+    'events',
+    'memberships'
+])
+
 
 def get_oauth_config():
     return {
@@ -137,6 +153,86 @@ async def list_tools():
     ]
 
 
+def format_contact(person: dict) -> str:
+    """Format a contact with all available fields."""
+    lines = []
+    
+    # Name
+    names = person.get('names', [])
+    if names:
+        lines.append(f"Name: {names[0].get('displayName', 'Unknown')}")
+    
+    # Resource name (ID)
+    lines.append(f"ID: {person.get('resourceName', 'N/A')}")
+    
+    # Emails
+    emails = person.get('emailAddresses', [])
+    if emails:
+        email_list = [e.get('value', '') for e in emails]
+        lines.append(f"Email: {', '.join(email_list)}")
+    
+    # Phones
+    phones = person.get('phoneNumbers', [])
+    if phones:
+        phone_list = [p.get('value', '') for p in phones]
+        lines.append(f"Phone: {', '.join(phone_list)}")
+    
+    # Addresses
+    addresses = person.get('addresses', [])
+    if addresses:
+        for addr in addresses:
+            formatted = addr.get('formattedValue', '')
+            addr_type = addr.get('type', '')
+            if formatted:
+                lines.append(f"Address ({addr_type}): {formatted}")
+    
+    # Birthday
+    birthdays = person.get('birthdays', [])
+    if birthdays:
+        bday = birthdays[0].get('date', {})
+        if bday:
+            month = bday.get('month', '')
+            day = bday.get('day', '')
+            year = bday.get('year', '')
+            bday_str = f"{month}/{day}" + (f"/{year}" if year else "")
+            lines.append(f"Birthday: {bday_str}")
+    
+    # Organizations
+    orgs = person.get('organizations', [])
+    if orgs:
+        for org in orgs:
+            org_name = org.get('name', '')
+            title = org.get('title', '')
+            if org_name or title:
+                lines.append(f"Organization: {org_name}" + (f" ({title})" if title else ""))
+    
+    return '\n'.join(lines)
+
+
+def get_all_contacts(service, person_fields: str = PERSON_FIELDS):
+    """Fetch ALL contacts with pagination."""
+    all_contacts = []
+    page_token = None
+    
+    while True:
+        results = service.people().connections().list(
+            resourceName='people/me',
+            pageSize=1000,  # Max allowed
+            personFields=person_fields,
+            pageToken=page_token,
+            sortOrder='FIRST_NAME_ASCENDING'
+        ).execute()
+        
+        contacts = results.get('connections', [])
+        all_contacts.extend(contacts)
+        
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+    
+    return all_contacts
+
+
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict):
     session_token = arguments.get("session_token", "")
@@ -147,61 +243,80 @@ async def call_tool(name: str, arguments: dict):
     
     try:
         if name == "list_contacts":
-            results = service.people().connections().list(
-                resourceName='people/me',
-                pageSize=arguments.get("max_results", 100),
-                personFields='names,emailAddresses,phoneNumbers',
-                sortOrder='FIRST_NAME_ASCENDING'
-            ).execute()
+            # Get ALL contacts with pagination
+            all_contacts = get_all_contacts(service)
             
-            contacts = results.get('connections', [])
-            if not contacts:
+            if not all_contacts:
                 return [TextContent(type="text", text="No contacts found.")]
             
             name_filter = (arguments.get("name_filter") or "").lower()
+            max_results = arguments.get("max_results", 100)
             output = []
-            for person in contacts:
+            
+            for person in all_contacts:
                 names = person.get('names', [])
                 if not names:
                     continue
                 display_name = names[0].get('displayName', 'Unknown')
                 if name_filter and name_filter not in display_name.lower():
                     continue
+                
                 emails = person.get('emailAddresses', [])
                 email = emails[0].get('value', '') if emails else ''
                 phones = person.get('phoneNumbers', [])
                 phone = phones[0].get('value', '') if phones else ''
-                output.append(f"- {display_name} | {email} | {phone}")
+                
+                # Include birthday if available
+                birthdays = person.get('birthdays', [])
+                bday_str = ""
+                if birthdays:
+                    bday = birthdays[0].get('date', {})
+                    if bday:
+                        bday_str = f" | Bday: {bday.get('month', '')}/{bday.get('day', '')}"
+                
+                output.append(f"- {display_name} | {email} | {phone}{bday_str}")
+                
+                if len(output) >= max_results:
+                    break
             
-            return [TextContent(type="text", text=f"Found {len(output)} contacts:\n" + "\n".join(output))]
+            total = len(all_contacts)
+            shown = len(output)
+            return [TextContent(type="text", text=f"Found {total} total contacts (showing {shown}):\n" + "\n".join(output))]
         
         elif name == "get_contact":
             identifier = arguments.get("identifier", "")
+            person = None
+            
             if identifier.startswith('people/'):
                 person = service.people().get(
                     resourceName=identifier,
-                    personFields='names,emailAddresses,phoneNumbers'
+                    personFields=PERSON_FIELDS
                 ).execute()
             else:
-                results = service.people().connections().list(
-                    resourceName='people/me',
-                    pageSize=100,
-                    personFields='names,emailAddresses,phoneNumbers'
-                ).execute()
-                person = None
-                for p in results.get('connections', []):
+                # Search by email or name
+                all_contacts = get_all_contacts(service)
+                identifier_lower = identifier.lower()
+                
+                for p in all_contacts:
+                    # Check emails
                     emails = p.get('emailAddresses', [])
-                    if emails and emails[0].get('value') == identifier:
+                    for email in emails:
+                        if email.get('value', '').lower() == identifier_lower:
+                            person = p
+                            break
+                    if person:
+                        break
+                    
+                    # Check name
+                    names = p.get('names', [])
+                    if names and identifier_lower in names[0].get('displayName', '').lower():
                         person = p
                         break
+                
                 if not person:
                     return [TextContent(type="text", text=f"Contact not found: {identifier}")]
             
-            names = person.get('names', [{}])[0]
-            emails = person.get('emailAddresses', [])
-            phones = person.get('phoneNumbers', [])
-            text = f"Name: {names.get('displayName', 'Unknown')}\nEmail: {emails[0].get('value') if emails else 'N/A'}\nPhone: {phones[0].get('value') if phones else 'N/A'}"
-            return [TextContent(type="text", text=text)]
+            return [TextContent(type="text", text=format_contact(person))]
         
         elif name == "create_contact":
             body = {'names': [{'givenName': arguments.get('given_name'), 'familyName': arguments.get('family_name', '')}]}
@@ -217,32 +332,39 @@ async def call_tool(name: str, arguments: dict):
             return [TextContent(type="text", text="Contact deleted.")]
         
         elif name == "search_contacts":
-            results = service.people().connections().list(
-                resourceName='people/me',
-                pageSize=100,
-                personFields='names,emailAddresses,phoneNumbers'
-            ).execute()
+            all_contacts = get_all_contacts(service)
             
             query = arguments.get("query", "").lower()
             max_results = arguments.get("max_results", 10)
             matches = []
             
-            for person in results.get('connections', []):
+            for person in all_contacts:
                 names = person.get('names', [])
                 name = names[0].get('displayName', '') if names else ''
-                emails = person.get('emailAddresses', [])
-                email = emails[0].get('value', '') if emails else ''
-                phones = person.get('phoneNumbers', [])
-                phone = phones[0].get('value', '') if phones else ''
                 
-                if query in name.lower() or query in email.lower() or query in phone:
-                    matches.append(f"- {name} | {email} | {phone}")
+                emails = person.get('emailAddresses', [])
+                email_values = [e.get('value', '').lower() for e in emails]
+                
+                phones = person.get('phoneNumbers', [])
+                phone_values = [p.get('value', '') for p in phones]
+                
+                # Search in all fields
+                match = False
+                if query in name.lower():
+                    match = True
+                elif any(query in e for e in email_values):
+                    match = True
+                elif any(query in p for p in phone_values):
+                    match = True
+                
+                if match:
+                    matches.append(format_contact(person))
                     if len(matches) >= max_results:
                         break
             
             if not matches:
                 return [TextContent(type="text", text=f"No contacts matching '{query}'.")]
-            return [TextContent(type="text", text=f"Found {len(matches)} matches:\n" + "\n".join(matches))]
+            return [TextContent(type="text", text=f"Found {len(matches)} matches:\n\n" + "\n\n---\n\n".join(matches))]
         
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
