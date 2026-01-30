@@ -126,6 +126,33 @@ async def list_tools():
             }
         ),
         Tool(
+            name="update_contact",
+            description="Update/enrich an existing contact with new information. Only provided fields will be updated.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_token": {"type": "string", "description": "Your authentication session token"},
+                    "resource_name": {"type": "string", "description": "Contact resource name (people/c...)"},
+                    "given_name": {"type": "string", "description": "First name"},
+                    "family_name": {"type": "string", "description": "Last name"},
+                    "email": {"type": "string", "description": "Email address to add"},
+                    "phone": {"type": "string", "description": "Phone number to add"},
+                    "address": {"type": "string", "description": "Street address"},
+                    "city": {"type": "string", "description": "City"},
+                    "state": {"type": "string", "description": "State/Region"},
+                    "postal_code": {"type": "string", "description": "Postal/ZIP code"},
+                    "country": {"type": "string", "description": "Country"},
+                    "birthday_month": {"type": "integer", "description": "Birthday month (1-12)"},
+                    "birthday_day": {"type": "integer", "description": "Birthday day (1-31)"},
+                    "birthday_year": {"type": "integer", "description": "Birthday year (optional)"},
+                    "organization": {"type": "string", "description": "Company/Organization name"},
+                    "job_title": {"type": "string", "description": "Job title"},
+                    "notes": {"type": "string", "description": "Notes/biography"}
+                },
+                "required": ["session_token", "resource_name"]
+            }
+        ),
+        Tool(
             name="delete_contact",
             description="Delete a contact",
             inputSchema={
@@ -326,6 +353,110 @@ async def call_tool(name: str, arguments: dict):
                 body['phoneNumbers'] = [{'value': arguments['phone']}]
             person = service.people().createContact(body=body).execute()
             return [TextContent(type="text", text=f"Contact created: {person.get('resourceName')}")]
+        
+        elif name == "update_contact":
+            resource_name = arguments.get('resource_name')
+            if not resource_name:
+                return [TextContent(type="text", text="Error: resource_name is required")]
+            
+            # First get the existing contact to get the etag
+            existing = service.people().get(
+                resourceName=resource_name,
+                personFields=PERSON_FIELDS
+            ).execute()
+            
+            # Build the update body - only include fields that are provided
+            update_body = {
+                'etag': existing.get('etag'),
+                'resourceName': resource_name
+            }
+            update_fields = []
+            
+            # Names
+            if arguments.get('given_name') or arguments.get('family_name'):
+                current_names = existing.get('names', [{}])[0]
+                update_body['names'] = [{
+                    'givenName': arguments.get('given_name') or current_names.get('givenName', ''),
+                    'familyName': arguments.get('family_name') or current_names.get('familyName', '')
+                }]
+                update_fields.append('names')
+            
+            # Email - add new email to existing list
+            if arguments.get('email'):
+                existing_emails = existing.get('emailAddresses', [])
+                new_email = {'value': arguments['email']}
+                # Check if email already exists
+                if not any(e.get('value') == arguments['email'] for e in existing_emails):
+                    existing_emails.append(new_email)
+                update_body['emailAddresses'] = existing_emails
+                update_fields.append('emailAddresses')
+            
+            # Phone - add new phone to existing list
+            if arguments.get('phone'):
+                existing_phones = existing.get('phoneNumbers', [])
+                new_phone = {'value': arguments['phone']}
+                # Check if phone already exists
+                if not any(p.get('value') == arguments['phone'] for p in existing_phones):
+                    existing_phones.append(new_phone)
+                update_body['phoneNumbers'] = existing_phones
+                update_fields.append('phoneNumbers')
+            
+            # Address
+            if any([arguments.get('address'), arguments.get('city'), arguments.get('state'), 
+                    arguments.get('postal_code'), arguments.get('country')]):
+                address = {
+                    'streetAddress': arguments.get('address', ''),
+                    'city': arguments.get('city', ''),
+                    'region': arguments.get('state', ''),
+                    'postalCode': arguments.get('postal_code', ''),
+                    'country': arguments.get('country', ''),
+                    'type': 'home'
+                }
+                existing_addresses = existing.get('addresses', [])
+                existing_addresses.append(address)
+                update_body['addresses'] = existing_addresses
+                update_fields.append('addresses')
+            
+            # Birthday
+            if arguments.get('birthday_month') and arguments.get('birthday_day'):
+                birthday = {
+                    'date': {
+                        'month': arguments['birthday_month'],
+                        'day': arguments['birthday_day']
+                    }
+                }
+                if arguments.get('birthday_year'):
+                    birthday['date']['year'] = arguments['birthday_year']
+                update_body['birthdays'] = [birthday]
+                update_fields.append('birthdays')
+            
+            # Organization
+            if arguments.get('organization') or arguments.get('job_title'):
+                org = {
+                    'name': arguments.get('organization', ''),
+                    'title': arguments.get('job_title', '')
+                }
+                existing_orgs = existing.get('organizations', [])
+                existing_orgs.append(org)
+                update_body['organizations'] = existing_orgs
+                update_fields.append('organizations')
+            
+            # Notes/Biography
+            if arguments.get('notes'):
+                update_body['biographies'] = [{'value': arguments['notes'], 'contentType': 'TEXT_PLAIN'}]
+                update_fields.append('biographies')
+            
+            if not update_fields:
+                return [TextContent(type="text", text="No fields to update. Provide at least one field to update.")]
+            
+            # Execute the update
+            updated = service.people().updateContact(
+                resourceName=resource_name,
+                updatePersonFields=','.join(update_fields),
+                body=update_body
+            ).execute()
+            
+            return [TextContent(type="text", text=f"Contact updated successfully!\n\n{format_contact(updated)}")]
         
         elif name == "delete_contact":
             service.people().deleteContact(resourceName=arguments.get('resource_name')).execute()
