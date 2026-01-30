@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mcp-google-contacts
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m mcp_google_contacts_server.main
+    envVars:
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: BASE_URL
+        sync: false

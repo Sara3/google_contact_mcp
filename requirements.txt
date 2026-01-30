@@ -1,9 +1,6 @@
+fastapi
+uvicorn
 mcp[cli]
 google-auth
 google-api-python-client
-google-auth-httplib2
 google-auth-oauthlib
-google-auth
-httpx
-pydantic
-typing-extensions
