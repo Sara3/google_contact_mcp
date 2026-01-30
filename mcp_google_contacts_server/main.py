@@ -3,12 +3,15 @@ MCP Google Contacts Server with per-user OAuth authentication.
 Designed for hosting on Render.
 """
 import os
+import json
 import secrets
 from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -16,8 +19,6 @@ from googleapiclient.discovery import build
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
-from starlette.routing import Route
-from sse_starlette.sse import EventSourceResponse
 
 # OAuth configuration
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -34,7 +35,6 @@ pending_states: Dict[str, str] = {}
 
 # Initialize MCP server
 mcp_server = Server("google-contacts")
-sse_transport = SseServerTransport("/messages/")
 
 
 def get_oauth_config():
@@ -77,7 +77,7 @@ async def list_tools():
                 "properties": {
                     "session_token": {"type": "string", "description": "Your authentication session token"},
                     "name_filter": {"type": "string", "description": "Optional filter by name"},
-                    "max_results": {"type": "integer", "description": "Max results (default 100)", "default": 100}
+                    "max_results": {"type": "integer", "description": "Max results", "default": 100}
                 },
                 "required": ["session_token"]
             }
@@ -89,7 +89,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "session_token": {"type": "string", "description": "Your authentication session token"},
-                    "identifier": {"type": "string", "description": "Resource name (people/*) or email"}
+                    "identifier": {"type": "string", "description": "Resource name or email"}
                 },
                 "required": ["session_token", "identifier"]
             }
@@ -116,7 +116,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "session_token": {"type": "string", "description": "Your authentication session token"},
-                    "resource_name": {"type": "string", "description": "Contact resource name (people/*)"}
+                    "resource_name": {"type": "string", "description": "Contact resource name"}
                 },
                 "required": ["session_token", "resource_name"]
             }
@@ -129,7 +129,7 @@ async def list_tools():
                 "properties": {
                     "session_token": {"type": "string", "description": "Your authentication session token"},
                     "query": {"type": "string", "description": "Search term"},
-                    "max_results": {"type": "integer", "description": "Max results (default 10)", "default": 10}
+                    "max_results": {"type": "integer", "description": "Max results", "default": 10}
                 },
                 "required": ["session_token", "query"]
             }
@@ -158,7 +158,7 @@ async def call_tool(name: str, arguments: dict):
             if not contacts:
                 return [TextContent(type="text", text="No contacts found.")]
             
-            name_filter = arguments.get("name_filter", "").lower()
+            name_filter = arguments.get("name_filter", "").lower() if arguments.get("name_filter") else ""
             output = []
             for person in contacts:
                 names = person.get('names', [])
@@ -195,12 +195,12 @@ async def call_tool(name: str, arguments: dict):
                         person = p
                         break
                 if not person:
-                    return [TextContent(type="text", text=f"Contact with email {identifier} not found.")]
+                    return [TextContent(type="text", text=f"Contact not found: {identifier}")]
             
             names = person.get('names', [{}])[0]
             emails = person.get('emailAddresses', [])
             phones = person.get('phoneNumbers', [])
-            text = f"Name: {names.get('displayName', 'Unknown')}\nEmail: {emails[0].get('value') if emails else 'N/A'}\nPhone: {phones[0].get('value') if phones else 'N/A'}\nResource: {person.get('resourceName')}"
+            text = f"Name: {names.get('displayName', 'Unknown')}\nEmail: {emails[0].get('value') if emails else 'N/A'}\nPhone: {phones[0].get('value') if phones else 'N/A'}"
             return [TextContent(type="text", text=text)]
         
         elif name == "create_contact":
@@ -214,7 +214,7 @@ async def call_tool(name: str, arguments: dict):
         
         elif name == "delete_contact":
             service.people().deleteContact(resourceName=arguments.get('resource_name')).execute()
-            return [TextContent(type="text", text=f"Contact deleted: {arguments.get('resource_name')}")]
+            return [TextContent(type="text", text=f"Contact deleted.")]
         
         elif name == "search_contacts":
             results = service.people().connections().list(
@@ -244,38 +244,33 @@ async def call_tool(name: str, arguments: dict):
                 return [TextContent(type="text", text=f"No contacts matching '{query}'.")]
             return [TextContent(type="text", text=f"Found {len(matches)} matches:\n" + "\n".join(matches))]
         
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-# FastAPI app
-app = FastAPI(title="Google Contacts MCP Server")
-
-
-@app.get("/")
-async def root():
-    return {
+# HTTP endpoints
+async def homepage(request: Request):
+    return JSONResponse({
         "service": "Google Contacts MCP Server",
         "status": "running",
         "auth_url": f"{BASE_URL}/auth",
-        "mcp_sse_url": f"{BASE_URL}/sse",
-        "mcp_messages_url": f"{BASE_URL}/messages/"
-    }
+        "mcp_sse_url": f"{BASE_URL}/sse"
+    })
 
 
-@app.get("/auth")
-async def start_auth(redirect_uri: Optional[str] = None):
+async def start_auth(request: Request):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(500, "OAuth not configured.")
+        return JSONResponse({"error": "OAuth not configured"}, status_code=500)
+    
+    redirect_uri = request.query_params.get("redirect_uri", BASE_URL)
     
     flow = Flow.from_client_config(get_oauth_config(), scopes=SCOPES)
     flow.redirect_uri = f"{BASE_URL}/oauth/callback"
     
     state = secrets.token_urlsafe(32)
-    pending_states[state] = redirect_uri or BASE_URL
+    pending_states[state] = redirect_uri
     
     auth_url, _ = flow.authorization_url(
         access_type='offline',
@@ -286,12 +281,14 @@ async def start_auth(redirect_uri: Optional[str] = None):
     return RedirectResponse(auth_url)
 
 
-@app.get("/oauth/callback")
-async def oauth_callback(code: str, state: str):
-    if state not in pending_states:
-        raise HTTPException(400, "Invalid state")
+async def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
     
-    redirect_uri = pending_states.pop(state)
+    if not code or state not in pending_states:
+        return JSONResponse({"error": "Invalid request"}, status_code=400)
+    
+    pending_states.pop(state)
     
     flow = Flow.from_client_config(get_oauth_config(), scopes=SCOPES)
     flow.redirect_uri = f"{BASE_URL}/oauth/callback"
@@ -302,7 +299,7 @@ async def oauth_callback(code: str, state: str):
     profile = service.people().get(resourceName='people/me', personFields='emailAddresses').execute()
     
     emails = profile.get('emailAddresses', [])
-    user_email = emails[0]['value'] if emails else profile.get('resourceName')
+    user_email = emails[0]['value'] if emails else "unknown"
     
     session_token = secrets.token_urlsafe(32)
     user_tokens[session_token] = {
@@ -320,17 +317,21 @@ async def oauth_callback(code: str, state: str):
     })
 
 
-@app.get("/status/{session_token}")
-async def check_status(session_token: str):
+async def check_status(request: Request):
+    session_token = request.path_params.get("session_token")
     if session_token in user_tokens:
-        return {"authenticated": True, "email": user_tokens[session_token].get("email")}
-    return {"authenticated": False}
+        return JSONResponse({"authenticated": True, "email": user_tokens[session_token].get("email")})
+    return JSONResponse({"authenticated": False})
 
 
-# MCP SSE endpoints
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    async with sse_transport.connect_sse(request.scope, request.receive, request._send) as streams:
+# SSE endpoint for MCP
+sse_transport = SseServerTransport("/messages/")
+
+
+async def handle_sse(request: Request):
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
         await mcp_server.run(
             streams[0],
             streams[1],
@@ -338,9 +339,21 @@ async def sse_endpoint(request: Request):
         )
 
 
-@app.post("/messages/")
-async def messages_endpoint(request: Request):
+async def handle_messages(request: Request):
     await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+
+
+# Build app
+app = Starlette(
+    routes=[
+        Route("/", homepage),
+        Route("/auth", start_auth),
+        Route("/oauth/callback", oauth_callback),
+        Route("/status/{session_token}", check_status),
+        Route("/sse", handle_sse),
+        Route("/messages/", handle_messages, methods=["POST"]),
+    ]
+)
 
 
 if __name__ == "__main__":
